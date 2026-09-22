@@ -166,10 +166,10 @@ jobs:
           fi
           echo "$APK_PRIVATE_KEY_B64" | tr -d '\r\n ' | base64 -d > /tmp/private-key.pem
           chmod 600 /tmp/private-key.pem
-          openssl ec -in /tmp/private-key.pem -pubout -out public-key.pem 2>/dev/null
 
           cd public
-          mkdir -p /tmp/keys && cp ../public-key.pem /tmp/keys/
+          openssl ec -in /tmp/private-key.pem -pubout -out public-key.pem 2>/dev/null
+          mkdir -p /tmp/keys && cp public-key.pem /tmp/keys/
           /usr/local/bin/apk.static mkndx \
             --allow-untrusted \
             --sign-key /tmp/private-key.pem \
