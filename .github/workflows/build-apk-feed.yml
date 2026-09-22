@@ -1,0 +1,152 @@
+# APK feed for OpenWrt / iStoreOS 25.12+ (apk-tools v3, ADB format).
+# Required secret: APK_PRIVATE_KEY_B64  (EC P-256 PEM private key, base64)
+
+name: Build Custom APK Feed (SmartDNS + Passwall)
+
+on:
+  push:
+    branches: [ main, master ]
+  schedule:
+    - cron: '18 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+jobs:
+  build-apk-feed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl jq python3 gzip openssl
+
+      - name: Install apk-tools
+        run: |
+          # v3.0.8+ is required (older mkndx has an ADB parsing bug)
+          curl -fsSLo /usr/local/bin/apk.static \
+            https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/v3.0.8/x86_64/apk.static
+          chmod +x /usr/local/bin/apk.static
+          /usr/local/bin/apk.static --version
+
+      - name: Collect packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p public
+          cd public
+
+          # passwall luci (official release)
+          RELEASE_DATA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest")
+          echo "$RELEASE_DATA" | jq -r '.assets[]? | select(.name | endswith(".apk")) | .browser_download_url' | while read -r url; do
+            echo "Downloading: $url"
+            wget -q -c "$url" || exit 1
+          done
+
+          # makeself .run packages from CloudRun (passwall cores, sing-box)
+          RUN_DATA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/wkccd/CloudRunFilesBuilder/releases/latest")
+          fetch_run() {
+            url=$(echo "$RUN_DATA" | jq -r --arg p "$1" '.assets[]? | select(.name | test($p)) | .browser_download_url' | head -n1)
+            [ -n "$url" ] || { echo "WARN: asset not found: $1"; return 0; }
+            echo "Downloading: $url"
+            wget -q -O "$2" "$url"
+            skip=$(sed -n 's/^skip="\([0-9]*\)"/\1/p' "$2" | head -n1)
+            [ -n "$skip" ] || { echo "WARN: bad makeself header: $2"; rm -f "$2"; return 0; }
+            tail -n "+$((skip+1))" "$2" | tar xz
+            rm -f "$2"
+          }
+          fetch_run '^25_PassWall_[0-9.]+_x86_64\.run$' pw.run
+          fetch_run '^25-sing-box.*x86_64.*\.run$' sb.run
+
+          # smartdns (upstream release)
+          SD_DATA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/pymumu/smartdns/releases/latest")
+          echo "$SD_DATA" | jq -r '.assets[]? | select(.name | endswith(".apk")) | select(.name | contains("lite") | not) | select(.name | test("all-luci-all$|x86_64-openwrt-all$")) | .browser_download_url' | while read -r url; do
+            echo "Downloading: $url"
+            wget -q -c "$url" || exit 1
+          done
+
+          ls -la
+
+      - name: Normalize package filenames
+        run: |
+          cd public
+          python3 <<'EOF'
+          import json, subprocess, glob, shutil, os
+          APK = "/usr/local/bin/apk.static"
+          for f in sorted(glob.glob("*.apk")):
+              r = subprocess.run([APK, "adbdump", "--format", "json", f], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"WARN: adbdump failed: {f}")
+                  continue
+              data = json.loads(r.stdout)
+              pkgs = data.get("packages") if isinstance(data, dict) and "packages" in data else data
+              if isinstance(pkgs, dict):
+                  pkgs = [pkgs]
+              name, ver = pkgs[0].get("name"), pkgs[0].get("version")
+              if not name or not ver:
+                  print(f"WARN: no metadata: {f}")
+                  continue
+              target = f"{name}-{ver}.apk"
+              if target == f:
+                  continue
+              if os.path.exists(target):
+                  print(f"WARN: duplicate, dropped: {f}")
+                  os.remove(f)
+                  continue
+              shutil.move(f, target)
+              print(f"MV {f} -> {target}")
+          EOF
+          ls -la
+
+      - name: Fetch adguardhome zh-cn i18n
+        continue-on-error: true
+        run: |
+          cd public
+          LIST=$(curl -fsSL --max-time 60 "https://downloads.openwrt.org/snapshots/packages/x86_64/luci/" || true)
+          FN=$(echo "$LIST" | grep -oE 'luci-i18n-adguardhome-zh-cn-[0-9][^"<> ]*\.apk' | head -n1)
+          if [ -n "$FN" ]; then
+            curl -fsSL --max-time 120 -o "$FN" "https://downloads.openwrt.org/snapshots/packages/x86_64/luci/$FN" || true
+            ls -la luci-i18n-adguardhome-zh-cn*.apk || true
+          else
+            echo "not found in snapshot feed, skipped"
+          fi
+
+      - name: Sign and build index
+        env:
+          APK_PRIVATE_KEY_B64: ${{ secrets.APK_PRIVATE_KEY_B64 }}
+        run: |
+          if [ -z "$APK_PRIVATE_KEY_B64" ]; then
+            echo "ERROR: secret APK_PRIVATE_KEY_B64 is not set"
+            exit 1
+          fi
+          echo "$APK_PRIVATE_KEY_B64" | tr -d '\r\n ' | base64 -d > /tmp/private-key.pem
+          chmod 600 /tmp/private-key.pem
+          openssl ec -in /tmp/private-key.pem -pubout -out public-key.pem 2>/dev/null
+
+          cd public
+          mkdir -p /tmp/keys && cp ../public-key.pem /tmp/keys/
+          /usr/local/bin/apk.static mkndx \
+            --allow-untrusted \
+            --sign-key /tmp/private-key.pem \
+            --description "custom feed $(date +%F)" \
+            --output packages.adb \
+            ./*.apk
+          /usr/local/bin/apk.static verify --keys-dir /tmp/keys packages.adb
+          /usr/local/bin/apk.static adbdump --format json packages.adb | jq -r '.packages[] | "\(.name) \(.version)"'
+          sha256sum packages.adb *.apk > SHA256SUMS
+          rm -f /tmp/private-key.pem
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          force_orphan: true
