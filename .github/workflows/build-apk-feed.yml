@@ -64,45 +64,82 @@ jobs:
           }
           fetch_run '^25_PassWall_[0-9.]+_x86_64\.run$' pw.run
           fetch_run '^25-sing-box.*x86_64.*\.run$' sb.run
+          rm -f install.sh
 
           # smartdns (upstream release)
           SD_DATA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/pymumu/smartdns/releases/latest")
-          echo "$SD_DATA" | jq -r '.assets[]? | select(.name | endswith(".apk")) | select(.name | contains("lite") | not) | select(.name | test("all-luci-all$|x86_64-openwrt-all$")) | .browser_download_url' | while read -r url; do
+          echo "$SD_DATA" | jq -r '.assets[]? | select(.name | endswith(".apk")) | select(.name | contains("lite") | not) | select(.name | test("(all-luci-all|x86_64-openwrt-all)\\.apk$")) | .browser_download_url' | while read -r url; do
             echo "Downloading: $url"
             wget -q -c "$url" || exit 1
           done
 
           ls -la
 
+      # apk fetches $base_url/$name-$version.apk, so filenames must equal
+      # the metadata name/version. The index dump is the source of truth.
       - name: Normalize package filenames
         run: |
           cd public
+          shopt -s nullglob
+
+          # strip release version prefixes
+          for f in 25.12+_*.apk 23.05-24.10_*.apk 22.03-_*.apk; do
+            t="${f#*_}"
+            [ "$f" = "$t" ] && continue
+            if [ -e "$t" ]; then rm -f "$f"; else mv "$f" "$t"; fi
+          done
+
+          /usr/local/bin/apk.static mkndx --allow-untrusted --output /tmp/pre.adb ./*.apk
+          /usr/local/bin/apk.static adbdump --format json /tmp/pre.adb > /tmp/pre.json
+          echo "--- index sample ---"; head -c 300 /tmp/pre.json; echo ""
+
           python3 <<'EOF'
-          import json, subprocess, glob, shutil, os
-          APK = "/usr/local/bin/apk.static"
-          for f in sorted(glob.glob("*.apk")):
-              r = subprocess.run([APK, "adbdump", "--format", "json", f], capture_output=True, text=True)
-              if r.returncode != 0:
-                  print(f"WARN: adbdump failed: {f}")
-                  continue
-              data = json.loads(r.stdout)
-              pkgs = data.get("packages") if isinstance(data, dict) and "packages" in data else data
-              if isinstance(pkgs, dict):
-                  pkgs = [pkgs]
-              name, ver = pkgs[0].get("name"), pkgs[0].get("version")
+          import json, os, glob, re
+          data = json.load(open('/tmp/pre.json'))
+          pkgs = data['packages'] if isinstance(data, dict) and 'packages' in data else data
+          if isinstance(pkgs, dict): pkgs = [pkgs]
+
+          def parse_size(v):
+              if isinstance(v, (int, float)): return int(v)
+              if isinstance(v, str):
+                  m = re.match(r'^([\d.]+)\s*([KMGTP]?)(i?B?)$', v.strip(), re.I)
+                  if m:
+                      n = float(m.group(1)); u = (m.group(2) or '').upper()
+                      return int(n * {'': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}[u])
+              return None
+
+          files = {f: os.path.getsize(f) for f in glob.glob('*.apk')}
+          renamed, missing = [], []
+          for p in pkgs:
+              name, ver = p.get('name'), p.get('version')
               if not name or not ver:
-                  print(f"WARN: no metadata: {f}")
+                  print('WARN: index entry without name/version'); continue
+              target = f'{name}-{ver}.apk'
+              if target in files:
                   continue
-              target = f"{name}-{ver}.apk"
-              if target == f:
-                  continue
-              if os.path.exists(target):
-                  print(f"WARN: duplicate, dropped: {f}")
-                  os.remove(f)
-                  continue
-              shutil.move(f, target)
-              print(f"MV {f} -> {target}")
+              size = parse_size(p.get('file-size'))
+              cands = [f for f, sz in files.items() if size is not None and sz == size]
+              if len(cands) > 1:
+                  nm = re.sub(r'[^a-z0-9]', '', name.lower())
+                  cands.sort(key=lambda f: (nm not in re.sub(r'[^a-z0-9]', '', f.lower()), len(f)))
+              if not cands:
+                  missing.append(f'{target} (size={size})'); continue
+              src = cands[0]
+              os.replace(src, target)
+              files.pop(src); files[target] = size
+              renamed.append(f'{src} -> {target}')
+              print(f'MV {src} -> {target}')
+
+          expected = {f'{p["name"]}-{p["version"]}.apk' for p in pkgs if p.get('name') and p.get('version')}
+          leftover = [f for f in glob.glob('*.apk') if f not in expected]
+          print(f'=== index entries: {len(pkgs)}, renamed: {len(renamed)}, leftover: {len(leftover)} ===')
+          if missing:
+              print('MISSING (no local file matched):')
+              for m in missing: print('  ' + m)
+          if leftover:
+              print('leftover files (not matching any index entry):')
+              for f in leftover: print('  ' + f)
           EOF
           ls -la
 
@@ -140,7 +177,19 @@ jobs:
             --output packages.adb \
             ./*.apk
           /usr/local/bin/apk.static verify --keys-dir /tmp/keys packages.adb
-          /usr/local/bin/apk.static adbdump --format json packages.adb | jq -r '.packages[] | "\(.name) \(.version)"'
+
+          # every index entry must have its name-version.apk on disk
+          /usr/local/bin/apk.static adbdump --format json packages.adb > /tmp/idx.json
+          jq -r '.packages[] | "\(.name)-\(.version).apk"' /tmp/idx.json > /tmp/want.txt
+          echo "--- index entries ---"; cat /tmp/want.txt
+          missing=$(while read -r w; do [ -e "$w" ] || echo "$w"; done < /tmp/want.txt)
+          if [ -n "$missing" ]; then
+            echo "ERROR: index entries without matching file:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "OK: all index entries have matching files"
+
           sha256sum packages.adb *.apk > SHA256SUMS
           rm -f /tmp/private-key.pem
 
