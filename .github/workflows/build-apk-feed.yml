@@ -21,12 +21,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Compare upstream release metadata (tags, asset names + sizes) against
+      # the state recorded at the last build; skip the whole build when the
+      # scheduled run finds nothing new. push / workflow_dispatch always build.
+      - name: Check for updates
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/gh-pages"
+          curl -fsSL --max-time 60 "$BASE/feed-state.txt" -o /tmp/old-state.txt || : > /tmp/old-state.txt
+
+          api() { curl -fsSL --max-time 60 -H "Authorization: Bearer $GH_TOKEN" "$1"; }
+
+          PW_TAG=$(api "https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest" | jq -r '.tag_name // empty')
+          CR_JSON=$(api "https://api.github.com/repos/wkccd/CloudRunFilesBuilder/releases/latest")
+          SD_TAG=$(api "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name // empty')
+          ADG=$(curl -fsSL --max-time 60 "https://downloads.openwrt.org/snapshots/packages/x86_64/luci/" | grep -oE 'luci-i18n-adguardhome-zh-cn-[0-9][^"<> ]*\.apk' | head -n1)
+
+          {
+            echo "passwall-release=$PW_TAG"
+            echo "cloudrun-pw=$(echo "$CR_JSON" | jq -r '.assets[]? | select(.name | test("^25_PassWall_[0-9.]+_x86_64\\.run$")) | .name + "|" + (.size|tostring)' | head -n1)"
+            echo "cloudrun-singbox=$(echo "$CR_JSON" | jq -r '.assets[]? | select(.name | test("^25-sing-box.*x86_64.*\\.run$")) | .name + "|" + (.size|tostring)' | head -n1)"
+            echo "cloudrun-xray=$(echo "$CR_JSON" | jq -r '.assets[]? | select(.name | test("^xray-core_v[0-9.]+_x86_64\\.run$")) | .name + "|" + (.size|tostring)' | head -n1)"
+            echo "smartdns-release=$SD_TAG"
+            echo "adg-i18n=${ADG:-none}"
+          } > /tmp/new-state.txt
+
+          echo "--- last published state ---"; cat /tmp/old-state.txt
+          echo "--- latest upstream state ---"; cat /tmp/new-state.txt
+
+          # empty token means a lookup failed - fall back to a full build
+          if [ ! -s /tmp/new-state.txt ] || grep -q '=$' /tmp/new-state.txt; then
+            echo "Detection incomplete, running full build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ] && cmp -s /tmp/old-state.txt /tmp/new-state.txt; then
+            echo "No upstream changes since the last build, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y ca-certificates curl jq python3 gzip openssl
 
       - name: Install apk-tools
+        if: steps.check.outputs.skip != 'true'
         run: |
           # v3.0.8+ is required (older mkndx has an ADB parsing bug)
           curl -fsSLo /usr/local/bin/apk.static \
@@ -35,6 +81,7 @@ jobs:
           /usr/local/bin/apk.static --version
 
       - name: Collect packages
+        if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -79,6 +126,7 @@ jobs:
       # apk fetches $base_url/$name-$version.apk, so filenames must equal
       # the metadata name/version. The index dump is the source of truth.
       - name: Normalize package filenames
+        if: steps.check.outputs.skip != 'true'
         run: |
           cd public
           shopt -s nullglob
@@ -168,6 +216,7 @@ jobs:
           ls -la
 
       - name: Fetch adguardhome zh-cn i18n
+        if: steps.check.outputs.skip != 'true'
         continue-on-error: true
         run: |
           cd public
@@ -181,6 +230,7 @@ jobs:
           fi
 
       - name: Sign and build index
+        if: steps.check.outputs.skip != 'true'
         env:
           APK_PRIVATE_KEY_B64: ${{ secrets.APK_PRIVATE_KEY_B64 }}
         run: |
@@ -215,9 +265,13 @@ jobs:
           echo "OK: all index entries have matching files"
 
           sha256sum packages.adb *.apk > SHA256SUMS
+          # record detection state for the next scheduled diff; skip on
+          # incomplete detection so a broken lookup never gets cached
+          grep -q '=$' /tmp/new-state.txt || cp /tmp/new-state.txt feed-state.txt
           rm -f /tmp/private-key.pem
 
       - name: Deploy to GitHub Pages
+        if: steps.check.outputs.skip != 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
