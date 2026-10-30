@@ -2,7 +2,7 @@
 
 A custom APK package feed for iStoreOS / OpenWrt 25.12+ (apk-tools v3, ADB index format), built and published automatically by GitHub Actions.
 
-自建 APK 软件源，面向 iStoreOS / OpenWrt 25.12+（apk-tools v3）。每天由 GitHub Actions 自动从各上游 release 抓取最新包、重建签名索引并发布到 GitHub Pages。
+自建 APK 软件源，面向 iStoreOS / OpenWrt 25.12+（apk-tools v3）。由 GitHub Actions 自动比对该源已发布版本与各上游最新 release，仅在检测到更新时才抓取新包、重建签名索引并发布到 GitHub Pages。
 
 ## 提供哪些包
 
@@ -15,7 +15,8 @@ A custom APK package feed for iStoreOS / OpenWrt 25.12+ (apk-tools v3, ADB index
 
 ## 工作方式
 
-- 定时任务（cron `18 22 * * *` UTC）抓取各上游最新 release；构建逻辑见 `.github/workflows/build-apk-feed.yml`
+- 每天定时（cron `18 22 * * *` UTC）比对各上游最新 release 与上次构建时的版本指纹（只查元数据、不下载包体），检测到变化才下载构建；构建逻辑见 `.github/workflows/build-apk-feed.yml`，在 Actions 页手动 Run workflow 可强制重建
+- `feed-state.txt` 保存上次构建时各上游的版本指纹（release tag、资产文件名与大小），供下次定时比对；指纹未变化时当天跳过构建
 - 文件名统一规整为 `名称-版本.apk`（与索引元数据严格一致，避免 fetch 404）
 - 同名包只保留版本最高的一个（多渠道抓取时版本可能短暂错位）
 - `apk mkndx --sign-key` 生成签名索引 `packages.adb`（EC P-256），本仓库根目录的 `public-key.pem` 为对应公钥
