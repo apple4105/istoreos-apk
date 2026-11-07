@@ -1,0 +1,6 @@
+passwall-release=26.11.3-1
+cloudrun-pw=25_PassWall_26.10.29_x86_64.run|32698990
+cloudrun-singbox=25-sing-box_v1.14.4_x86_64.run|32179471
+cloudrun-xray=xray-core_v26.9.30_x86_64.run|14431451
+smartdns-release=Release48.4
+adg-i18n=luci-i18n-adguardhome-zh-cn-26.309.80019~2cd0c0b.apk
